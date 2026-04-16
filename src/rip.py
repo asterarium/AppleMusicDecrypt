@@ -3,11 +3,11 @@ import subprocess
 from typing import Dict, Optional
 
 from creart import it
-from tenacity import retry, stop_after_attempt, wait_fixed
+from tenacity import retry, stop_after_attempt, wait_random_exponential, retry_if_exception_type
 
 from src.api import WebAPI
 from src.config import Config
-from src.exceptions import CodecNotFoundException, SongNotPassIntegrityCheckException
+from src.exceptions import CodecNotFoundException, RetryableDecryptException, SongNotPassIntegrityCheckException
 from src.flags import Flags
 from src.grpc.manager import WrapperManager
 from src.legacy.decrypt import WidevineDecrypt
@@ -119,9 +119,8 @@ class Ripper:
                 return
 
             if not m3u8_url:
-                task.logger.logger.error("Lossless audio does not exist")
                 task.update_status(Status.FAILED)
-                task.error = Exception("Lossless audio does not exist")
+                task.error = Exception("Failed to fetch M3U8 URL")
                 return
 
             try:
@@ -141,78 +140,67 @@ class Ripper:
                     task.update_status(Status.DONE)
                     return
 
-            # Wait in queue
-            task.logger.logger.info("Waiting for available download streams...")
-            async with it(WebAPI).download_lock:
-                async def _phase2():
-                    # Download
-                    task.logger.downloading()
-                    task.update_status(Status.DOWNLOADING)
-                    raw_song = await it(WebAPI)._download_song_internal(task.m3u8Info.uri)
-        
-                    # Decrypt
-                    task.logger.decrypting()
-                    task.update_status(Status.DECRYPTING)
-        
-                    task.info = await run_sync(extract_song, raw_song, get_codec_from_codec_id(task.m3u8Info.codec_id))
-                    # Initialize futures for each sample
-                    for i in range(len(task.info.samples)):
-                        task.decrypted_samples_futures[i] = asyncio.get_running_loop().create_future()
-        
-                    # Launch decryption for all samples with tenacity
-                    decryption_tasks = []
-                    for sampleIndex, sample in enumerate(task.info.samples):
-                        decryption_tasks.append(
-                            self.decrypt_sample_with_retry(task.adamId, task.m3u8Info.keys[sample.descIndex], sample.data,
-                                                           sampleIndex)
-                        )
-                        if sampleIndex % 100 == 0:
-                            await asyncio.sleep(0)
-        
-                    # Wait for all decryption tasks to complete.
-                    # If any decrypt_sample_with_retry fails (raises exception after retries), we catch it.
-                    await asyncio.gather(*decryption_tasks)
-        
-                    # Encapsulate and Save
-                    # Collect results from futures in order
-                    decrypted_samples = []
-                    for i in range(len(task.info.samples)):
-                        # At this point all futures should have result because gather completed successfully
-                        decrypted_samples.append(task.decrypted_samples_futures[i].result())
-        
-                    local_codec = get_codec_from_codec_id(task.m3u8Info.codec_id)
-        
-                    song_bytes = await run_sync(encapsulate, task.info, bytes().join(decrypted_samples),
-                                          it(Config).download.atmosConventToM4a)
-                    if not if_raw_atmos(local_codec, it(Config).download.atmosConventToM4a):
-                        if local_codec != Codec.EC3 and local_codec != Codec.AC3:
-                            song_bytes = await run_sync(fix_encapsulate, song_bytes)
-                        song_bytes = await run_sync(write_metadata, song_bytes, task.metadata, it(Config).metadata.embedMetadata,
-                                              it(Config).download.coverFormat, task.info.params)
-                        if local_codec == Codec.AAC or local_codec == Codec.AAC_DOWNMIX or local_codec == Codec.AAC_BINAURAL:
-                            song_bytes = await run_sync(fix_esds_box, task.info.raw, song_bytes)
-        
-                    if not await run_sync(check_song_integrity, song_bytes):
-                        if it(Config).download.failedSongNotPassIntegrityCheck:
-                            task.logger.failed_integrity(True)
-                            task.update_status(Status.FAILED)
-                            raise SongNotPassIntegrityCheckException("Integrity Check Failed")
-                        else:
-                            task.logger.failed_integrity(False)
-                            task.error = SongNotPassIntegrityCheckException("Integrity Check Warning")
-        
-                    local_filename = await run_sync(save, song_bytes, local_codec, task.metadata, task.playlist)
-                    task.logger.saved()
-                    task.update_status(Status.DONE)
-        
-                    if it(Config).download.afterDownloaded:
-                        command = it(Config).download.afterDownloaded.format(filename=local_filename)
-                        subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                
-                if timeout_sec > 0:
-                    await asyncio.wait_for(_phase2(), timeout=timeout_sec)
-                else:
-                    await _phase2()
+            async def _phase2():
+                task.logger.logger.info("Waiting for available download streams...")
+                task.logger.downloading()
+                task.update_status(Status.DOWNLOADING)
+                raw_song = await it(WebAPI).download_song(task.m3u8Info.uri)
+
+                task.logger.decrypting()
+                task.update_status(Status.DECRYPTING)
+
+                task.info = await run_sync(extract_song, raw_song, get_codec_from_codec_id(task.m3u8Info.codec_id))
+                for i in range(len(task.info.samples)):
+                    task.decrypted_samples_futures[i] = asyncio.get_running_loop().create_future()
+
+                decryption_tasks = []
+                for sampleIndex, sample in enumerate(task.info.samples):
+                    decryption_tasks.append(
+                        self.decrypt_sample_with_retry(task.adamId, task.m3u8Info.keys[sample.descIndex], sample.data,
+                                                       sampleIndex)
+                    )
+                    if sampleIndex % 100 == 0:
+                        await asyncio.sleep(0)
+
+                await asyncio.gather(*decryption_tasks)
+
+                decrypted_samples = []
+                for i in range(len(task.info.samples)):
+                    decrypted_samples.append(task.decrypted_samples_futures[i].result())
+
+                local_codec = get_codec_from_codec_id(task.m3u8Info.codec_id)
+
+                song_bytes = await run_sync(encapsulate, task.info, bytes().join(decrypted_samples),
+                                      it(Config).download.atmosConventToM4a)
+                if not if_raw_atmos(local_codec, it(Config).download.atmosConventToM4a):
+                    if local_codec != Codec.EC3 and local_codec != Codec.AC3:
+                        song_bytes = await run_sync(fix_encapsulate, song_bytes)
+                    song_bytes = await run_sync(write_metadata, song_bytes, task.metadata, it(Config).metadata.embedMetadata,
+                                          it(Config).download.coverFormat, task.info.params)
+                    if local_codec == Codec.AAC or local_codec == Codec.AAC_DOWNMIX or local_codec == Codec.AAC_BINAURAL:
+                        song_bytes = await run_sync(fix_esds_box, task.info.raw, song_bytes)
+
+                if not await run_sync(check_song_integrity, song_bytes):
+                    if it(Config).download.failedSongNotPassIntegrityCheck:
+                        task.logger.failed_integrity(True)
+                        task.update_status(Status.FAILED)
+                        raise SongNotPassIntegrityCheckException("Integrity Check Failed")
+                    else:
+                        task.logger.failed_integrity(False)
+                        task.error = SongNotPassIntegrityCheckException("Integrity Check Warning")
+
+                local_filename = await run_sync(save, song_bytes, local_codec, task.metadata, task.playlist)
+                task.logger.saved()
+                task.update_status(Status.DONE)
+
+                if it(Config).download.afterDownloaded:
+                    command = it(Config).download.afterDownloaded.format(filename=local_filename)
+                    subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            if timeout_sec > 0:
+                await asyncio.wait_for(_phase2(), timeout=timeout_sec)
+            else:
+                await _phase2()
 
         except asyncio.TimeoutError:
             task.logger.logger.warning("Task processing timed out after waiting in queue")
@@ -229,6 +217,7 @@ class Ripper:
             task.error = Exception("Task execution timed out")
             raise
         finally:
+            self._fail_pending_decrypt_futures(task, Exception("Task cancelled or cleaned up"))
             await self.download_manager.unregister_task(task)
             task.update_status(task.status)  # Ensure status is set
             if task.parentDone:
@@ -253,40 +242,40 @@ class Ripper:
         try:
             task.m3u8Info = await legacy_extract_media(await it(WrapperManager).webPlayback(task.adamId))
 
-            async with it(WebAPI).download_lock:
-                async def _phase2():
-                    task.logger.downloading()
-                    task.update_status(Status.DOWNLOADING)
-                    raw_song = await it(WebAPI)._download_song_internal(task.m3u8Info.uri)
-                    task.info = await run_sync(extract_song, raw_song, Codec.AAC_LEGACY)
-                    
-                    task.logger.decrypting()
-                    task.update_status(Status.DECRYPTING)
-                    wvDecrypt = WidevineDecrypt()
-                    challenge = wvDecrypt.generate_challenge(task.m3u8Info.keys[0].split(",")[1])
-                    wvLicense = await it(WrapperManager).license(adam_id=task.adamId, challenge=challenge,
-                                                                 kid=task.m3u8Info.keys[0])
-                    keys = wvDecrypt.generate_key(wvLicense)
-                    song_bytes = await run_sync(legacy_decrypt, raw_song, keys[1].kid.hex, keys[1].key.hex())
-        
-                    song_bytes = await run_sync(write_metadata, song_bytes, task.metadata, it(Config).metadata.embedMetadata,
-                                          it(Config).download.coverFormat, task.info.params)
-        
-                    if not await run_sync(check_song_integrity, song_bytes):
-                        task.logger.failed_integrity(True)
-        
-                    local_filename = await run_sync(save, song_bytes, Codec.AAC_LEGACY, task.metadata, task.playlist)
-                    task.logger.saved()
-                    task.update_status(Status.DONE)
-        
-                    if it(Config).download.afterDownloaded:
-                        command = it(Config).download.afterDownloaded.format(filename=local_filename)
-                        subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            async def _phase2():
+                task.logger.logger.info("Waiting for available download streams...")
+                task.logger.downloading()
+                task.update_status(Status.DOWNLOADING)
+                raw_song = await it(WebAPI).download_song(task.m3u8Info.uri)
+                task.info = await run_sync(extract_song, raw_song, Codec.AAC_LEGACY)
 
-                if timeout_sec > 0:
-                    await asyncio.wait_for(_phase2(), timeout=timeout_sec)
-                else:
-                    await _phase2()
+                task.logger.decrypting()
+                task.update_status(Status.DECRYPTING)
+                wvDecrypt = WidevineDecrypt()
+                challenge = wvDecrypt.generate_challenge(task.m3u8Info.keys[0].split(",")[1])
+                wvLicense = await it(WrapperManager).license(adam_id=task.adamId, challenge=challenge,
+                                                             kid=task.m3u8Info.keys[0])
+                keys = wvDecrypt.generate_key(wvLicense)
+                song_bytes = await run_sync(legacy_decrypt, raw_song, keys[1].kid.hex, keys[1].key.hex())
+
+                song_bytes = await run_sync(write_metadata, song_bytes, task.metadata, it(Config).metadata.embedMetadata,
+                                      it(Config).download.coverFormat, task.info.params)
+
+                if not await run_sync(check_song_integrity, song_bytes):
+                    task.logger.failed_integrity(True)
+
+                local_filename = await run_sync(save, song_bytes, Codec.AAC_LEGACY, task.metadata, task.playlist)
+                task.logger.saved()
+                task.update_status(Status.DONE)
+
+                if it(Config).download.afterDownloaded:
+                    command = it(Config).download.afterDownloaded.format(filename=local_filename)
+                    subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            if timeout_sec > 0:
+                await asyncio.wait_for(_phase2(), timeout=timeout_sec)
+            else:
+                await _phase2()
 
         except asyncio.TimeoutError:
             task.logger.logger.warning("Task processing timed out after waiting in queue")
@@ -357,7 +346,9 @@ class Ripper:
             song = Song(id=track.id, storefront=url.storefront, url="", type=URLType.Song)
             safely_create_task(self.rip_song(song, codec, flags, done_handler, playlist=playlist_info))
 
-    @retry(stop=stop_after_attempt(3), wait=wait_fixed(1))
+    @retry(retry=retry_if_exception_type(RetryableDecryptException),
+           stop=stop_after_attempt(it(Config).download.retryTime),
+           wait=wait_random_exponential(multiplier=1, max=it(Config).download.maxWaitTime))
     async def decrypt_sample_with_retry(self, adam_id: str, key: str, sample: bytes, sample_index: int):
         task = self.download_manager.get_task(adam_id)
         if not task:
@@ -372,8 +363,12 @@ class Ripper:
         # We need to send the command to wrapper manager
         await it(WrapperManager).decrypt(adam_id, key, sample, sample_index)
 
-        # Wait for the future to be resolved by the callback
-        return await future
+        try:
+            return await asyncio.wait_for(future, timeout=it(Config).download.maxWaitTime)
+        except asyncio.TimeoutError as exc:
+            raise RetryableDecryptException(
+                f"Decrypt sample timed out after {it(Config).download.maxWaitTime}s"
+            ) from exc
 
     async def on_decrypt_success(self, adam_id: str, key: str, sample: bytes, sample_index: int):
         it(Measurer).record_decrypt(len(sample))
@@ -382,10 +377,27 @@ class Ripper:
             if not task.decrypted_samples_futures[sample_index].done():
                 task.decrypted_samples_futures[sample_index].set_result(sample)
 
-    async def on_decrypt_failed(self, adam_id: str, key: str, sample: bytes, sample_index: int):
+    async def on_decrypt_failed(self, adam_id: str, key: str, sample: bytes, sample_index: int, error_msg: str):
         task = self.download_manager.get_task(adam_id)
         if task and sample_index in task.decrypted_samples_futures:
             if not task.decrypted_samples_futures[sample_index].done():
-                task.decrypted_samples_futures[sample_index].set_exception(Exception("Decryption failed callback"))
+                if self._is_retryable_remote_failure(error_msg):
+                    task.decrypted_samples_futures[sample_index].set_exception(RetryableDecryptException(error_msg))
+                else:
+                    task.decrypted_samples_futures[sample_index].set_exception(Exception(error_msg))
+
+    async def on_decrypt_stream_error(self, exc: Exception):
+        retry_exc = RetryableDecryptException(str(exc))
+        for task in list(self.download_manager.adam_id_task_mapping.values()):
+            self._fail_pending_decrypt_futures(task, retry_exc)
+
+    def _fail_pending_decrypt_futures(self, task: Task, exc: Exception):
+        for future in task.decrypted_samples_futures.values():
+            if not future.done():
+                future.set_exception(exc)
+
+    def _is_retryable_remote_failure(self, error_msg: str) -> bool:
+        normalized = (error_msg or "").lower()
+        return any(marker in normalized for marker in ("429", "too many requests", "unavailable", "internal"))
 
     # Removed recv_decrypted_sample and on_decrypt_done as they are replaced by linear flow in rip_song

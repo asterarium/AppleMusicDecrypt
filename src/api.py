@@ -14,6 +14,7 @@ from src.config import Config
 from src.logger import GlobalLogger
 from src.measurer import Measurer
 from src.models import *
+from src.runtime import http_proxy_kwargs
 
 
 class NameSolver:
@@ -48,13 +49,19 @@ class WebAPI:
     download_lock: asyncio.Semaphore
     request_lock: asyncio.Semaphore
     token: str
+    proxy: str | None
 
     def __init__(self, proxy: str, parallel_num: int):
+        self.proxy = proxy if proxy else None
         self._set_token()
-        self.client = AsyncCacheClient(headers={"Authorization": f"Bearer {self.token}",
-                                                       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-                                                       "Origin": "https://music.apple.com"},
-                                              proxy=proxy if proxy else None)
+        self.client = AsyncCacheClient(
+            headers={
+                "Authorization": f"Bearer {self.token}",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+                "Origin": "https://music.apple.com",
+            },
+            **http_proxy_kwargs(self.proxy),
+        )
         self.download_lock = asyncio.Semaphore(parallel_num)
         self.request_lock = asyncio.Semaphore(256)
 
@@ -62,7 +69,7 @@ class WebAPI:
            wait=wait_random_exponential(multiplier=1, max=it(Config).download.maxWaitTime),
            stop=stop_after_attempt(it(Config).download.retryTime))
     def _set_token(self):
-        with httpx.Client() as client:
+        with httpx.Client(follow_redirects=True, **http_proxy_kwargs(self.proxy)) as client:
             resp = client.get("https://music.apple.com", follow_redirects=True)
             index_js_uri = regex.findall(r"/assets/index~[^/]+\.js", resp.text)[0]
             js_resp = client.get("https://music.apple.com" + index_js_uri)
@@ -87,7 +94,11 @@ class WebAPI:
     async def _download_song_internal(self, url: str) -> bytes:
         result = BytesIO()
         timeout = httpx.Timeout(15.0, read=60.0, connect=15.0, pool=20.0)
-        async with httpx.AsyncClient(transport=AsyncCustomHost(NameSolver()), timeout=timeout) as client:
+        async with httpx.AsyncClient(
+            transport=AsyncCustomHost(NameSolver()),
+            timeout=timeout,
+            **http_proxy_kwargs(self.proxy),
+        ) as client:
             async with client.stream('GET', url) as response:
                 total = int(response.headers.get("Content-Length") if response.headers.get("Content-Length")
                             else response.headers.get("X-Apple-MS-Content-Length"))

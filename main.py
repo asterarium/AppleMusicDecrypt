@@ -1,6 +1,11 @@
 import asyncio
+from pathlib import Path
 
 from creart import add_creator
+
+from src.runtime import bootstrap_dependency_path
+
+bootstrap_dependency_path(Path(__file__).resolve().parent)
 
 loop = asyncio.new_event_loop()
 

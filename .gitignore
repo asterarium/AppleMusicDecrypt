@@ -164,3 +164,7 @@ config.toml
 .python-version
 .vscode/*
 /extras/telegram_bot/bot_database.db
+
+# Project-specific
+deps/
+assets/wrapper-manager.qcow2

@@ -1,9 +1,13 @@
 # DO NOT EDIT IT
-version = "0.0.10"
+version = "0.0.11"
 
 [instance]
 url = "127.0.0.1:8080"
 secure = false
+# Proxy used only for wrapper-manager gRPC.
+# Leave empty to avoid overriding system gRPC proxy settings.
+# Only supports HTTP CONNECT proxy URIs such as http://127.0.0.1:7890
+proxy = ""
 
 [localInstance]
 # Use qemu to launch wrapper-manager
@@ -29,7 +33,10 @@ language = "zh-Hant-HK"
 languageNotExistWarning = true
 
 [download]
-# Send request to Apple Music through proxy. Only support http and https protocol
+# Proxy used by this program's HTTP(S) requests, including token fetching,
+# Apple Music API calls, audio downloads, and wrapper image downloads.
+# Leave empty to avoid overriding system HTTP proxy settings.
+# Only support http and https protocol.
 proxy = ""
 # Number of concurrent song downloads
 parallelNum = 1

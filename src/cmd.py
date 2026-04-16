@@ -44,20 +44,40 @@ class InteractiveShell:
             loop.run_until_complete(self.localInstance.launch_instance(loop))
             it(Config).instance.url = "127.0.0.1:32767"
             it(Config).instance.secure = False
-            loop.run_until_complete(it(WrapperManager).init(it(Config).instance.url, it(Config).instance.secure))
+            loop.run_until_complete(
+                it(WrapperManager).init(
+                    it(Config).instance.url,
+                    it(Config).instance.secure,
+                    it(Config).instance.proxy,
+                )
+            )
             while True:
                 it(WrapperManager).status.cache_invalidate()
                 if loop.run_until_complete(it(WrapperManager).status()).ready:
                     break
                 loop.run_until_complete(asyncio.sleep(3))
         else:
-            loop.run_until_complete(it(WrapperManager).init(it(Config).instance.url, it(Config).instance.secure))
+            loop.run_until_complete(
+                it(WrapperManager).init(
+                    it(Config).instance.url,
+                    it(Config).instance.secure,
+                    it(Config).instance.proxy,
+                )
+            )
         safely_create_task(it(WrapperManager).decrypt_init(on_success=self.ripper.on_decrypt_success,
-                                                           on_failure=self.ripper.on_decrypt_failed))
+                                                           on_failure=self.ripper.on_decrypt_failed,
+                                                           on_stream_error=self.ripper.on_decrypt_stream_error))
         try:
             loop.run_until_complete(self.show_status())
         except grpc.aio._call.AioRpcError:
-            it(GlobalLogger).logger.error("Unable to connect to the wrapper-manager")
+            it(GlobalLogger).logger.error(
+                "Unable to connect to the wrapper-manager "
+                f"(target={it(Config).instance.url}, secure={it(Config).instance.secure}, "
+                f"grpc_proxy={'configured' if it(Config).instance.proxy else 'system/default'})"
+            )
+            sys.exit()
+        except WrapperManagerException as e:
+            it(GlobalLogger).logger.error(e.msg)
             sys.exit()
 
         if config_outdated():
@@ -285,7 +305,7 @@ class InteractiveShell:
         return two_step_code
 
     async def login_flow(self):
-        await it(WrapperManager).init(it(Config).instance.url, it(Config).instance.secure)
+        await it(WrapperManager).init(it(Config).instance.url, it(Config).instance.secure, it(Config).instance.proxy)
         session = PromptSession()
         username = await session.prompt_async("Username: ")
         password = await session.prompt_async("Password: ", is_password=True)
@@ -298,7 +318,7 @@ class InteractiveShell:
         it(WrapperManager).status.cache_invalidate()
 
     async def logout_flow(self):
-        await it(WrapperManager).init(it(Config).instance.url, it(Config).instance.secure)
+        await it(WrapperManager).init(it(Config).instance.url, it(Config).instance.secure, it(Config).instance.proxy)
         session = PromptSession()
         username = await session.prompt_async("Username: ")
         try:

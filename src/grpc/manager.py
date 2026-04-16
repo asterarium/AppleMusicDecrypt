@@ -4,16 +4,16 @@ from typing import Awaitable, Callable, Type
 
 from async_lru import alru_cache
 from creart import AbstractCreator, CreateTargetInfo, exists_module, it
-from grpc import ssl_channel_credentials
-from grpc.aio import insecure_channel, Channel, secure_channel
+from grpc import ssl_channel_credentials, StatusCode
+from grpc.aio import AioRpcError, insecure_channel, Channel, secure_channel
 from grpc.experimental import ChannelOptions
-from tenacity import retry_if_exception_type, retry, wait_random_exponential, stop_after_attempt, \
-    retry_if_not_exception_message, before_sleep_log
+from tenacity import retry, retry_if_exception, wait_random_exponential, stop_after_attempt, before_sleep_log
 
 from src.grpc.manager_pb2 import *
 from src.grpc.manager_pb2_grpc import WrapperManagerServiceStub, google_dot_protobuf_dot_empty__pb2
 from src.logger import GlobalLogger
 from src.config import Config
+from src.runtime import configure_grpc_proxy_environment
 from src.utils import safely_create_task
 
 
@@ -22,17 +22,55 @@ class WrapperManagerException(Exception):
         self.msg = msg
 
 
+RETRYABLE_RPC_STATUS_CODES = {
+    StatusCode.UNAVAILABLE,
+    StatusCode.INTERNAL,
+    StatusCode.RESOURCE_EXHAUSTED,
+    StatusCode.DEADLINE_EXCEEDED,
+}
+NON_RETRYABLE_WRAPPER_MESSAGES = ("no available instance", "no such account")
+
+
+def _is_retryable_rpc_exception(exc: Exception) -> bool:
+    if isinstance(exc, WrapperManagerException):
+        message = exc.msg.lower()
+        return not any(marker in message for marker in NON_RETRYABLE_WRAPPER_MESSAGES)
+    if isinstance(exc, AioRpcError):
+        details = (exc.details() or "").lower()
+        if exc.code() in RETRYABLE_RPC_STATUS_CODES:
+            return True
+        return "status: 429" in details or "too many requests" in details
+    return False
+
+
 class WrapperManager:
     _channel: Channel
     _stub: WrapperManagerServiceStub
     _decrypt_queue: asyncio.Queue[DecryptRequest]
     _login_lock: asyncio.Lock
+    _target_url: str
+    _secure: bool
+    _explicit_proxy: str | None
 
     def __init__(self):
         self._login_lock = asyncio.Lock()
         self._decrypt_queue = asyncio.Queue()
+        self._target_url = ""
+        self._secure = False
+        self._explicit_proxy = None
 
-    async def init(self, url: str, secure: bool):
+    async def init(self, url: str, secure: bool, proxy: str = ""):
+        try:
+            self._explicit_proxy = configure_grpc_proxy_environment(url, proxy)
+        except ValueError as exc:
+            raise WrapperManagerException(str(exc)) from exc
+
+        self._target_url = url
+        self._secure = secure
+        self._build_channel()
+        return self
+
+    def _build_channel(self):
         service_config_json = json.dumps(
             {
                 "methodConfig": [
@@ -50,14 +88,25 @@ class WrapperManager:
             }
         )
         options = ((ChannelOptions.SingleThreadedUnaryStream, 1), ("grpc.service_config", service_config_json))
-        if secure:
-            self._channel = secure_channel(url, credentials=ssl_channel_credentials(), options=options)
+        if self._secure:
+            self._channel = secure_channel(self._target_url, credentials=ssl_channel_credentials(), options=options)
         else:
-            self._channel = insecure_channel(url, options=options)
+            self._channel = insecure_channel(self._target_url, options=options)
         self._stub = WrapperManagerServiceStub(self._channel)
-        return self
+
+    async def _reconnect_decrypt_channel(self, retry_delay: float):
+        await asyncio.sleep(retry_delay)
+        try:
+            await self._channel.close()
+        except Exception:
+            pass
+        self._build_channel()
 
     @alru_cache
+    @retry(retry=retry_if_exception(_is_retryable_rpc_exception),
+           wait=wait_random_exponential(multiplier=1, max=it(Config).download.maxWaitTime),
+           stop=stop_after_attempt(it(Config).download.retryTime),
+           before_sleep=before_sleep_log(it(GlobalLogger).logger, "WARNING"))
     async def status(self) -> StatusData:
         resp: StatusReply = await self._stub.Status(google_dot_protobuf_dot_empty__pb2.Empty)
         if resp.header.code != 0:
@@ -107,29 +156,66 @@ class WrapperManager:
         while True:
             yield await self._decrypt_queue.get()
 
-    async def decrypt_init(self, on_success: Callable[[str, str, bytes, int], Awaitable[None]],
-                           on_failure: Callable[[str, str, bytes, int], Awaitable[None]]):
-        stream = self._stub.Decrypt(self._decrypt_request_generator())
-        safely_create_task(self._decrypt_keepalive())
-        async for reply in stream:
-            reply: DecryptReply
-            if reply.data.adam_id == "KEEPALIVE":
-                continue
-            match reply.header.code:
-                case -1:
-                    safely_create_task(
-                        on_failure(reply.data.adam_id, reply.data.key, reply.data.sample, reply.data.sample_index))
-                case 0:
-                    safely_create_task(
-                        on_success(reply.data.adam_id, reply.data.key, reply.data.sample, reply.data.sample_index))
+    async def decrypt_init(self,
+                           on_success: Callable[[str, str, bytes, int], Awaitable[None]],
+                           on_failure: Callable[[str, str, bytes, int, str], Awaitable[None]],
+                           on_stream_error: Callable[[Exception], Awaitable[None]]):
+        retry_delay = 1.0
+        while True:
+            keepalive_task = asyncio.create_task(self._decrypt_keepalive())
+            stream = self._stub.Decrypt(self._decrypt_request_generator())
+            try:
+                async for reply in stream:
+                    reply: DecryptReply
+                    retry_delay = 1.0
+                    if reply.data.adam_id == "KEEPALIVE":
+                        continue
+                    match reply.header.code:
+                        case -1:
+                            safely_create_task(
+                                on_failure(
+                                    reply.data.adam_id,
+                                    reply.data.key,
+                                    reply.data.sample,
+                                    reply.data.sample_index,
+                                    reply.header.msg,
+                                )
+                            )
+                        case 0:
+                            safely_create_task(
+                                on_success(reply.data.adam_id, reply.data.key, reply.data.sample, reply.data.sample_index))
+            except asyncio.CancelledError:
+                raise
+            except AioRpcError as exc:
+                self._log_rpc_error("Decrypt stream terminated", exc)
+                self._clear_decrypt_queue()
+                await on_stream_error(exc)
+                await self._reconnect_decrypt_channel(retry_delay)
+                retry_delay = min(retry_delay * 2, it(Config).download.maxWaitTime)
+            else:
+                stream_closed = WrapperManagerException("Decrypt stream closed unexpectedly")
+                it(GlobalLogger).logger.error(stream_closed.msg)
+                self._clear_decrypt_queue()
+                await on_stream_error(stream_closed)
+                await self._reconnect_decrypt_channel(retry_delay)
+                retry_delay = min(retry_delay * 2, it(Config).download.maxWaitTime)
+            finally:
+                keepalive_task.cancel()
+                await asyncio.gather(keepalive_task, return_exceptions=True)
 
     async def _decrypt_keepalive(self):
         while True:
             await self._decrypt_queue.put(DecryptRequest(data=DecryptData(adam_id="KEEPALIVE")))
             await asyncio.sleep(15)
 
-    @retry(retry=((retry_if_exception_type(WrapperManagerException)) & (
-            retry_if_not_exception_message('no available instance'))),
+    def _clear_decrypt_queue(self):
+        while not self._decrypt_queue.empty():
+            try:
+                self._decrypt_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+    @retry(retry=retry_if_exception(_is_retryable_rpc_exception),
            wait=wait_random_exponential(multiplier=1, max=it(Config).download.maxWaitTime),
            stop=stop_after_attempt(it(Config).download.retryTime), before_sleep=before_sleep_log(it(GlobalLogger).logger, "WARNING"))
     async def m3u8(self, adam_id: str) -> str:
@@ -138,8 +224,7 @@ class WrapperManager:
             raise WrapperManagerException(resp.header.msg)
         return resp.data.m3u8
 
-    @retry(retry=((retry_if_exception_type(WrapperManagerException)) & (
-            retry_if_not_exception_message('no such account'))),
+    @retry(retry=retry_if_exception(_is_retryable_rpc_exception),
            wait=wait_random_exponential(multiplier=1, max=it(Config).download.maxWaitTime),
            stop=stop_after_attempt(it(Config).download.retryTime), before_sleep=before_sleep_log(it(GlobalLogger).logger, "WARNING"))
     async def logout(self, username: str):
@@ -148,8 +233,7 @@ class WrapperManager:
             raise WrapperManagerException(resp.header.msg)
         return
 
-    @retry(retry=((retry_if_exception_type(WrapperManagerException)) & (
-            retry_if_not_exception_message('no available instance'))),
+    @retry(retry=retry_if_exception(_is_retryable_rpc_exception),
            wait=wait_random_exponential(multiplier=1, max=it(Config).download.maxWaitTime),
            stop=stop_after_attempt(it(Config).download.retryTime), before_sleep=before_sleep_log(it(GlobalLogger).logger, "WARNING"))
     async def lyrics(self, adam_id: str, language: str, region: str) -> str:
@@ -159,8 +243,7 @@ class WrapperManager:
             raise WrapperManagerException(resp.header.msg)
         return resp.data.lyrics
 
-    @retry(retry=((retry_if_exception_type(WrapperManagerException)) & (
-            retry_if_not_exception_message('no available instance'))),
+    @retry(retry=retry_if_exception(_is_retryable_rpc_exception),
            wait=wait_random_exponential(multiplier=1, max=it(Config).download.maxWaitTime),
            stop=stop_after_attempt(it(Config).download.retryTime), before_sleep=before_sleep_log(it(GlobalLogger).logger, "WARNING"))
     async def webPlayback(self, adam_id: str) -> str:
@@ -171,8 +254,7 @@ class WrapperManager:
             raise WrapperManagerException(resp.header.msg)
         return resp.data.m3u8
 
-    @retry(retry=((retry_if_exception_type(WrapperManagerException)) & (
-            retry_if_not_exception_message('no available instance'))),
+    @retry(retry=retry_if_exception(_is_retryable_rpc_exception),
            wait=wait_random_exponential(multiplier=1, max=it(Config).download.maxWaitTime),
            stop=stop_after_attempt(it(Config).download.retryTime), before_sleep=before_sleep_log(it(GlobalLogger).logger, "WARNING"))
     async def license(self, adam_id: str, challenge: str, kid: str) -> str:
@@ -182,6 +264,23 @@ class WrapperManager:
         if resp.header.code != 0:
             raise WrapperManagerException(resp.header.msg)
         return resp.data.license
+
+    def _log_rpc_error(self, action: str, exc: AioRpcError) -> None:
+        proxy_state = self._explicit_proxy if self._explicit_proxy else "system/default"
+        it(GlobalLogger).logger.error(
+            f"{action}: target={self._target_url}, secure={self._secure}, grpc_proxy={proxy_state}, "
+            f"code={exc.code().name}, details={exc.details()}"
+        )
+        details = exc.details() or ""
+        debug_error = exc.debug_error_string() or ""
+        if "RST_STREAM with error code 2" in details or 'Failed "execute_batch"' in debug_error:
+            it(GlobalLogger).logger.error(
+                "The wrapper-manager gRPC stream looks like it was interrupted by a proxy or HTTP/2 CONNECT incompatibility."
+            )
+        if "status: 429" in details or "received http2 header with status: 429" in details:
+            it(GlobalLogger).logger.error(
+                "The wrapper-manager or an upstream proxy returned HTTP 429. This is treated as a retryable transport error."
+            )
 
 
 class WMCreator(AbstractCreator):

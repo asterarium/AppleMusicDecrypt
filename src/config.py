@@ -5,12 +5,13 @@ from creart import exists_module
 from creart.creator import AbstractCreator, CreateTargetInfo
 from pydantic import BaseModel
 
-CONFIG_VERSION = "0.0.10"
+CONFIG_VERSION = "0.0.11"
 
 
 class Instance(BaseModel):
     url: str = "127.0.0.1:8080"
     secure: bool = False
+    proxy: str = ""
 
 
 class LocalInstance(BaseModel):

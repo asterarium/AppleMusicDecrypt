@@ -11,6 +11,7 @@ from tenacity import retry, retry_if_exception_type, wait_random_exponential, st
 
 from src.config import Config
 from src.logger import GlobalLogger
+from src.runtime import http_proxy_kwargs
 
 ARGUMENTS = ["qemu-system-x86_64", "-machine q35", f"-cpu {it(Config).localInstance.cpuModel}",
              f"-m {it(Config).localInstance.memorySize}", "-hda assets/wrapper-manager.qcow2",
@@ -123,7 +124,10 @@ class QemuInstance:
 
     async def get_instance_image(self):
         it(GlobalLogger).logger.warning("The wrapper-manager image does not exist. Downloading...")
-        async with httpx.AsyncClient(follow_redirects=True) as client:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            **http_proxy_kwargs(it(Config).download.proxy),
+        ) as client:
             resp = await client.get(
                 "https://nightly.link/WorldObservationLog/wrapper-manager/workflows/wrapper-manager-image/main/wrapper-manager-image.zip")
             with zipfile.ZipFile(BytesIO(resp.content), "r") as f:

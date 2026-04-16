@@ -83,10 +83,15 @@ For Windows users: use [the pre-configured version](https://nightly.link/WorldOb
 git clone https://github.com/WorldObservationLog/AppleMusicDecrypt.git
 cd AppleMusicDecrypt
 bash ./tools/install-deps.sh
-poetry install
+uv venv .venv
+poetry env use .venv/Scripts/python.exe
+poetry sync
 cp config.example.toml config.toml
-poetry run python main.py
+./.venv/Scripts/python.exe main.py
 ```
+
+`download.proxy` only affects this program's HTTP(S) requests.
+`instance.proxy` only affects wrapper-manager gRPC connections.
 
 ## FAQ
 ### Song did not pass the integrity check
