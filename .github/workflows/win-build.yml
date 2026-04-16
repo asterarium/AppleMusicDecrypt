@@ -17,12 +17,15 @@ jobs:
           (Get-Content config.toml) -replace 'enable = false','enable = true' | Set-Content config.toml
           
           @'
-          $env:PATH="$(Split-Path -Parent $MyInvocation.MyCommand.Path)\deps;"
-          .\.venv\python.exe main.py
+          Set-Location (Split-Path -Parent $MyInvocation.MyCommand.Path)
+          .\.venv\Scripts\python.exe main.py
           '@ | Out-File -FilePath start.ps1 -Encoding UTF8
-          
+
           @'
-          set PATH=%~dp0deps; && .venv\python.exe main.py
+          @echo off
+          cd /d "%~dp0"
+          .venv\Scripts\python.exe main.py
+          pause
           '@ | Out-File -FilePath start.bat -Encoding ASCII
       - name: Prepare dependencies
         run: |
