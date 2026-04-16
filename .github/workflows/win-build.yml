@@ -46,8 +46,13 @@ jobs:
           rm -Recurse Bento4-tools.zip, 7z, 7z.exe, 7z-installer.exe, ffmpeg.7z, gpac-installer.exe, GPAC, qemu-installer.exe, qemu
 
       - name: Prepare assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          Invoke-WebRequest -Uri https://nightly.link/WorldObservationLog/wrapper-manager/workflows/wrapper-manager-image/main/wrapper-manager-image.zip -OutFile wrapper-manager-image.zip
+          $headers = @{ Authorization = "Bearer $env:GH_TOKEN" }
+          $artifacts = Invoke-RestMethod -Uri "https://api.github.com/repos/WorldObservationLog/wrapper-manager/actions/artifacts?name=wrapper-manager-image&per_page=1" -Headers $headers
+          $downloadUrl = $artifacts.artifacts[0].archive_download_url
+          Invoke-WebRequest -Uri $downloadUrl -Headers $headers -OutFile wrapper-manager-image.zip
           Expand-Archive -Path wrapper-manager-image.zip -DestinationPath assets
           rm wrapper-manager-image.zip
 
@@ -60,3 +65,37 @@ jobs:
         with:
           name: AppleMusicDecrypt-Windows
           path: .
+
+  beta-release:
+    name: Beta Release
+    runs-on: ubuntu-latest
+    needs: build_winodws
+    if: github.ref == 'refs/heads/v2' && github.event_name == 'push'
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: AppleMusicDecrypt-Windows
+          path: AppleMusicDecrypt-Windows
+
+      - name: Package artifact
+        run: cd AppleMusicDecrypt-Windows && zip -r ../AppleMusicDecrypt-Windows.zip .
+
+      - name: Delete old beta release
+        run: gh release delete beta-latest --yes || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+
+      - name: Create Beta Release
+        run: |
+          gh release create beta-latest AppleMusicDecrypt-Windows.zip \
+            --title "Beta Build ($(date -u +%Y-%m-%d))" \
+            --notes "Automated beta build from v2 branch" \
+            --prerelease
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
